@@ -1,102 +1,177 @@
-// ============================================================
-//  ProCrush Backend — API kiểm tra giao dịch chuyển khoản SePay
-// ============================================================
-// Mục đích: giữ SEPAY_TOKEN an toàn ở phía server (KHÔNG bao giờ
-// đưa token này vào code frontend/HTML/JS chạy trên trình duyệt).
-// Frontend (index.html) chỉ gọi tới API nội bộ này, server mới là
-// nơi thực sự gọi sang SePay bằng token bí mật.
-//
-// Cách chạy:
-//   1) npm install
-//   2) Tạo file .env (copy từ .env.example) và điền SEPAY_TOKEN thật
-//   3) npm start
-// ============================================================
-
-require("dotenv").config();
-const express = require("express");
-const cors = require("cors");
+const express = require('express');
+const cors = require('cors');
+const sqlite3 = require('sqlite3').verbose();
+const bcrypt = require('bcryptjs');
+const jwt = require('jwt-simple');
+const axios = require('axios');
+require('dotenv').config();
 
 const app = express();
-const PORT = process.env.PORT || 3000;
-const SEPAY_TOKEN = process.env.SEPAY_TOKEN;
-
-if (!SEPAY_TOKEN) {
-    console.error("❌ Thiếu SEPAY_TOKEN trong file .env — server không thể kiểm tra giao dịch.");
-    process.exit(1);
-}
-
-app.use(cors()); // Khi lên production, nên giới hạn origin cụ thể thay vì cho phép tất cả
+app.use(cors());
 app.use(express.json());
 
-// Cache đơn giản trong bộ nhớ để tránh gọi SePay quá dày mỗi khi có
-// nhiều người cùng mở modal thanh toán (SePay có thể giới hạn tần suất gọi).
-let transactionsCache = { data: null, fetchedAt: 0 };
-const CACHE_TTL_MS = 3000; // 3 giây
+const PORT = process.env.PORT || 10000;
+const JWT_SECRET = process.env.JWT_SECRET || 'procrush_secret_key_2026';
+const SEPAY_TOKEN = process.env.SEPAY_TOKEN;
 
-async function fetchRecentTransactions() {
-    const now = Date.now();
-    if (transactionsCache.data && now - transactionsCache.fetchedAt < CACHE_TTL_MS) {
-        return transactionsCache.data;
+// 1. Khởi tạo Database SQLite
+const db = new sqlite3.Database('./database.sqlite', (err) => {
+    if (err) console.error("Lỗi mở DB:", err.message);
+    else console.log("✅ Đã kết nối CSDDL SQLite.");
+});
+
+// Tạo bảng users và orders
+db.serialize(() => {
+    db.run(`CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        fullName TEXT,
+        email TEXT UNIQUE,
+        password TEXT,
+        isPro INTEGER DEFAULT 0,
+        createdAt DATETIME DEFAULT CURRENT_TIMESTAMP
+    )`);
+
+    db.run(`CREATE TABLE IF NOT EXISTS orders (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        code TEXT UNIQUE,
+        email TEXT,
+        amount INTEGER,
+        status TEXT DEFAULT 'PENDING',
+        createdAt DATETIME DEFAULT CURRENT_TIMESTAMP
+    )`);
+});
+
+// Middleware xác thực Token
+function authenticateToken(req, res, next) {
+    const authHeader = req.headers['authorization'];
+    const token = authHeader && authHeader.split(' ')[1];
+    if (!token) return res.status(401).json({ error: "Thất bại xác thực tài khoản" });
+
+    try {
+        const decoded = jwt.decode(token, JWT_SECRET);
+        req.user = decoded;
+        next();
+    } catch (e) {
+        return res.status(403).json({ error: "Token không hợp lệ" });
     }
-
-    const response = await fetch("https://my.sepay.vn/userapi/transactions/list?limit=20", {
-        method: "GET",
-        headers: {
-            "Authorization": `Bearer ${SEPAY_TOKEN}`,
-            "Content-Type": "application/json"
-        }
-    });
-
-    if (!response.ok) {
-        throw new Error(`SePay trả về lỗi HTTP ${response.status}`);
-    }
-
-    const json = await response.json();
-    transactionsCache = { data: json, fetchedAt: now };
-    return json;
 }
 
-/**
- * GET /api/check-sepay-transaction?code=PROCRUSH123456&amount=39000
- *
- * Trả về: { paid: true }  nếu tìm thấy giao dịch tiền vào (in) khớp:
- *   - Nội dung chuyển khoản CÓ CHỨA mã đơn hàng (code)
- *   - Số tiền giao dịch >= amount yêu cầu
- * Ngược lại trả về: { paid: false }
- */
-app.get("/api/check-sepay-transaction", async (req, res) => {
-    try {
-        const { code, amount } = req.query;
+// 2. API Đăng Ký Tài Khoản
+app.post('/api/auth/register', (req, res) => {
+    const { fullName, email, password } = req.body;
+    if (!fullName || !email || !password) return res.status(400).json({ error: "Vui lòng điền đủ thông tin" });
 
-        if (!code || !amount) {
-            return res.status(400).json({ error: "Thiếu tham số 'code' hoặc 'amount'." });
+    const hashedPassword = bcrypt.hashSync(password, 10);
+    const sql = `INSERT INTO users (fullName, email, password) VALUES (?, ?, ?)`;
+    
+    db.run(sql, [fullName, email, hashedPassword], function(err) {
+        if (err) {
+            if (err.message.includes('UNIQUE')) return res.status(400).json({ error: "Email này đã có tài khoản!" });
+            return res.status(500).json({ error: err.message });
+        }
+        const token = jwt.encode({ id: this.lastID, email }, JWT_SECRET);
+        res.json({ token, user: { fullName, email, isPro: false } });
+    });
+});
+
+// 3. API Đăng Nhập
+app.post('/api/auth/login', (req, res) => {
+    const { email, password } = req.body;
+    const sql = `SELECT * FROM users WHERE email = ?`;
+
+    db.get(sql, [email], (err, user) => {
+        if (err || !user) return res.status(400).json({ error: "Email này chưa có tài khoản!" });
+
+        if (!bcrypt.compareSync(password, user.password)) {
+            return res.status(400).json({ error: "Mật khẩu không chính xác" });
         }
 
-        const requiredAmount = parseInt(amount, 10);
-        if (Number.isNaN(requiredAmount)) {
-            return res.status(400).json({ error: "'amount' không hợp lệ." });
-        }
-
-        const data = await fetchRecentTransactions();
-        const transactions = data?.transactions || [];
-
-        const matched = transactions.some((tx) => {
-            const content = (tx.transaction_content || tx.content || "").toUpperCase();
-            const amountIn = parseInt(tx.amount_in || tx.amountIn || "0", 10);
-            return content.includes(String(code).toUpperCase()) && amountIn >= requiredAmount;
+        const token = jwt.encode({ id: user.id, email: user.email }, JWT_SECRET);
+        res.json({
+            token,
+            user: {
+                fullName: user.fullName,
+                email: user.email,
+                isPro: user.isPro === 1
+            }
         });
-
-        return res.json({ paid: matched });
-    } catch (err) {
-        console.error("Lỗi khi kiểm tra giao dịch SePay:", err.message);
-        return res.status(500).json({ error: "Không thể kiểm tra giao dịch lúc này, thử lại sau." });
-    }
+    });
 });
 
-app.get("/", (req, res) => {
-    res.send("ProCrush Backend đang chạy. Dùng GET /api/check-sepay-transaction?code=...&amount=...");
+// 4. API Quên mật khẩu
+app.post('/api/auth/forgot-password', (req, res) => {
+    const { email, newPassword } = req.body;
+    if (!email || !newPassword) return res.status(400).json({ error: "Thiếu thông tin" });
+
+    const hashedPassword = bcrypt.hashSync(newPassword, 10);
+    db.run(`UPDATE users SET password = ? WHERE email = ?`, [hashedPassword, email], function(err) {
+        if (err || this.changes === 0) return res.status(400).json({ error: "Email không tồn tại trên hệ thống" });
+        res.json({ message: "Cập nhật mật khẩu thành công" });
+    });
 });
 
-app.listen(PORT, () => {
-    console.log(`✅ ProCrush Backend đang chạy tại http://localhost:${PORT}`);
+// 5. API Lấy thông tin User hiện tại
+app.get('/api/auth/me', authenticateToken, (req, res) => {
+    db.get(`SELECT fullName, email, isPro FROM users WHERE id = ?`, [req.user.id], (err, user) => {
+        if (err || !user) return res.status(404).json({ error: "Không tìm thấy người dùng" });
+        res.json({ user: { ...user, isPro: user.isPro === 1 } });
+    });
 });
+
+// 6. API Tạo đơn hàng thanh toán
+app.post('/api/payment/create-order', authenticateToken, (req, res) => {
+    db.get(`SELECT isPro FROM users WHERE id = ?`, [req.user.id], (err, user) => {
+        if (user && user.isPro === 1) return res.json({ alreadyPro: true });
+
+        const code = "PROCRUSH" + Math.floor(100000 + Math.random() * 900000);
+        const amount = parseInt(process.env.PRO_PASS_AMOUNT) || 39000;
+        const email = req.user.email;
+
+        db.run(`INSERT INTO orders (code, email, amount) VALUES (?, ?, ?)`, [code, email, amount], function(err) {
+            if (err) return res.status(500).json({ error: "Không thể khởi tạo mã đơn hàng" });
+            res.json({ code, amount });
+        });
+    });
+});
+
+// 7. API Kiểm tra trạng thái thanh toán từ SePay
+app.get('/api/payment/status', async (req, res) => {
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, private');
+    const { code } = req.query;
+
+    if (!code) return res.status(400).json({ paid: false });
+
+    db.get(`SELECT * FROM orders WHERE code = ?`, [code], async (err, order) => {
+        if (order && order.status === 'COMPLETED') {
+            return res.json({ paid: true });
+        }
+
+        try {
+            const response = await axios.get(`https://my.sepay.vn/userapi/transactions/list`, {
+                headers: { 'Authorization': `Bearer ${SEPAY_TOKEN}` },
+                params: { limit: 20 }
+            });
+
+            const transactions = response.data.transactions || [];
+            const isMatch = transactions.some(t => {
+                const content = (t.transaction_content || "").replace(/\s+/g, '').toUpperCase();
+                const inAmount = parseFloat(t.amount_in || 0);
+                return content.includes(code.toUpperCase()) && inAmount >= 39000;
+            });
+
+            if (isMatch) {
+                db.run(`UPDATE orders SET status = 'COMPLETED' WHERE code = ?`, [code]);
+                if (order && order.email) {
+                    db.run(`UPDATE users SET isPro = 1 WHERE email = ?`, [order.email]);
+                }
+                return res.json({ paid: true });
+            }
+
+            return res.json({ paid: false });
+        } catch (error) {
+            return res.json({ paid: false });
+        }
+    });
+});
+
+app.listen(PORT, () => console.log(`✅ Server ProCrush Backend đang chạy tại cổng ${PORT}`));
